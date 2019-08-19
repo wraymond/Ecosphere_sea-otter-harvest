@@ -1,0 +1,906 @@
+---
+title: "Sea_otter_simulation_model"
+author: "Wendel Raymond"
+date: "August 19, 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+**NOTE** This script as written requires parallel computing. The script is designed to automate the set up with minimal effect on computer performance. However, when running full replicate similations this can slow a computer down.
+
+# Sea otter population simulation model
+This model was developed by Wendel Raymond and Tim Tinker with the purpose to testing the effect of known sea otter harvest in Southeast Alaska. The model is initiated with the original reintorduced population of sea otters in space. The model runs through time in XX sub populations. Parameters governing sea otter growth and movement are taken from published sources.
+
+```{r libraries}
+library(BMS)
+library(ggplot2)
+library(foreach)
+library(doParallel)
+library(gtools)
+library(stats)
+library(reshape2)
+library(MASS)
+library(ggplot2)
+theme_set(theme_classic())
+```
+
+
+```{r parallel set}
+cores <- detectCores() - 1
+cl <- makeCluster(cores[1]) 
+registerDoParallel(cl)
+```
+
+## Load files
+Data for running simulation model
+```{r load data}
+## Load data ##
+data <- read.csv("All_data/Blockdata_new.csv", header = TRUE) 
+BlokOcc <- read.csv("All_data/BlokOcc.csv", header = TRUE)
+Blocks <- data.frame(BlokOcc$Block_ID) # save names in order
+colnames(Blocks) <- "Block_ID" # rename
+BlokOcc <- BlokOcc[,4:49]
+Harvest <- read.csv("All_data/N_Harvest.csv", header = TRUE) ## note this will throw an error without obtaining harvest data and running the Harvest_assignment.Rmd
+Harvest <- Harvest[,4:49]
+
+## Inter-pop movement probs, baseline pairwise matrices ## 
+destJF <- read.csv("All_data/destJF.csv", header = FALSE)
+destAF <- read.csv("All_data/destAF.csv", header = FALSE)
+destJM <- read.csv("All_data/destJM.csv", header = FALSE)
+destAM <- read.csv("All_data/destAM.csv", header = FALSE)
+Demdat <- read.csv("All_data/RandDem.csv", header = TRUE)
+Survest <- read.csv("All_data/Survey_est.csv", header = TRUE)
+
+## Load Subregion data on estimated K ##
+# dfReg <- read_excel("All_data/Subregion_Data_11.2.2017.xlsx")
+
+## Harvested sea otter demographics by year and block ##
+Harvest_demos <- read.csv("All_data/Harvestdemos.csv", header = TRUE)
+```
+
+## Set Model Parameters
+```{r model params}
+# Set user-specified params
+reps = 10000            # Number replications for population sims
+S = 4                 # Number of age/sex classes 
+HarvestOpt = 0        # Option for modeling harvest: 0 = no harvest, 1 = random age/sex, 2 = male/juv biased, 3 = data-based estimate
+HarvestAdj = 1        # Adjustment factor for harves: 1 = no adjustment, 1.1 = +10% adjustment, etc.
+sig = 0.13            # Environmental stochasticity (std dev in log-lambda)
+vals = dim(BlokOcc)   # determine number of blocks and years
+P = vals[1]           # number blocks (or sub-populations)
+Nyrs = vals[2]        # Number of years
+rmax = 0.25           # Maximin rate of growth ~ 20% per year
+theta = 1             # theta parameter for theta-logistic (value of 1 = basic Ricker model) 
+Years = c(1970:(1970+Nyrs-1))  
+N0 = data$Startpop
+Harvest = Harvest*HarvestAdj
+## Dispersal probabilities ##
+JFD = data$Jfdisp 
+AFD = data$Afdisp
+JMD = data$Jmdisp
+AMD = data$Amdisp
+disp = matrix(data = NA,nrow = 4, ncol = P)
+disp[1,] = JFD
+disp[2,] = AFD
+disp[3,] = JMD
+disp[4,] = AMD
+## Estimate K for each Block #
+Areahab = data$Area_km
+Kmn = data$Mean_Kdens
+Ksd = data$SD_Kdens * 0.0001
+KV = Ksd^2
+## *Create a default matrix with lambda ~1.22 (rmax) ##
+A = matrix(c(
+  0.7176,    0.4608,    0,         0,
+  0.2524,    0.9800,    0,         0,
+  0,         0.4608,    0.7132,    0,
+  0,         0,         0.2468,    0.9700),byrow=T,ncol=4)    
+#
+W <- eigen(A)$vector;         # W=matrix of right eigenvectors 
+lambdas <- eigen(A)$values;   # lambdas=vector of eigenvalues
+lambda <- max(Re(lambdas))		# lambda1=dominant eigenvalue, real part only
+w <- abs(W[,1])					      # w=stable distribution, unscaled
+sad <- w/sum(w)               # w=stable distribution, scaled
+```
+
+## Run Simulation
+```{r run sim}
+## Cycle through reps **NOTE N = with harvest, N2 = without harvest
+simresults = foreach(r=1:reps) %dopar% {  
+  N = matrix(0,nrow=P,ncol=Nyrs)
+  N2 = N
+  # Re-Initialize population vector at year 1 (using N0) for each rep
+  n = array(data = 0, c(4,P,Nyrs))
+  nt = matrix(data = 0,nrow = 4, ncol = 1) 
+  nd = matrix(data = 0,nrow = 4, ncol = 1)
+  K = matrix(data = 0, nrow =  length(Areahab), ncol = 1)
+  # Assign carrying capacity
+  for (i in 1:P){
+    n[1:4, i, 1] = rmultinom(1, N0[i], sad) 
+    # KDmean = rlnorm(1,log(Kmn[i]/sqrt(1+KV[i]/Kmn[i]^2)),sqrt(log(1+KV[i]/Kmn[i]^2)))
+    # K[i] = KDmean*Areahab[i]  # *.75 NO ADJUSTMENT NEEDED
+    K[i] = Kmn[i]*Areahab[i]
+  }
+  n2 = n; n2t=nt; nd2 = nd
+  # random coin-toss for rounding (demog stochasticity)
+  rnd = rbinom(Nyrs, 1, .5) 
+  N[,1] = colSums(n[, , 1])
+  N2[,1] = N[,1]
+  for (y in 2:Nyrs) {
+    Yearnum = Years[y]
+    for (i in 1:P){
+      if (BlokOcc[i, y] == 1){
+        Bloknm = data$Subpop[i]
+        envstoch = rnorm(1, 0, sig)
+        # Calculate D-D lambda (with stochasticity) and select appropriate vital rates
+        # both for harvest and no harvest scenario
+        lamstoch = max(.95, min(1.22, round(exp(rmax * (1 - (N[i, y-1] / K[i])^theta) +
+                                                  envstoch), 2)))
+        lamstoch2 = max(.95, min(1.22, round(exp(rmax * (1 - (N2[i, y-1] / K[i])^theta) +
+                                                  envstoch), 2)))        
+        idxs = which(round(Demdat$Lam,2) == lamstoch)
+        if(length(idxs)==1){
+          j=idxs
+        }else{
+          j = sample(idxs,1)
+        }
+        br = 0.5*Demdat$br2[j]; wr = Demdat$wr2[j];
+        fsj = Demdat$fs1[j]; fsa = Demdat$fs2[j]; 
+        msj = Demdat$ms1[j]; msa = Demdat$ms2[j];
+        gf = Demdat$Gf[j]; gm = Demdat$Gm[j];
+        AP = matrix(c(
+          fsj*(1-gf),  br*wr*fsa,      0,           0,    
+          fsj*gf,      fsa,            0,           0,
+          0,           br*wr*fsa,      msj*(1-gm),  0,
+          0,           0,              msj*gm,      msa), nrow=4, ncol=4, byrow = T)
+        #
+        # Next lines do matrix multiplication (within-block demog transitions)
+        nt[1:4,1] = n[1:4,i,y-1]
+        if (rnd[y]){
+          nt1 = floor(AP%*%nt)   # randomly round up or down to integers
+        } else  {
+          nt1 = ceiling(AP%*%nt)
+        }
+        # Now Without harvest
+        idxs2 = which(round(Demdat$Lam,2) == lamstoch2)
+        if(length(idxs2)==1){
+          j=idxs2
+        }else{
+          j = sample(idxs2,1)
+        }
+        br = 0.5*Demdat$br2[j]; wr = Demdat$wr2[j];
+        fsj2 = Demdat$fs1[j]; fsa2 = Demdat$fs2[j]; 
+        msj2 = Demdat$ms1[j]; msa2 = Demdat$ms2[j];
+        gf = Demdat$Gf[j]; gm = Demdat$Gm[j];
+        AP2 = matrix(c(
+          fsj2*(1-gf),  br*wr*fsa2,      0,            0,    
+          fsj2*gf,      fsa2,            0,            0,
+          0,            br*wr*fsa2,      msj2*(1-gm),  0,
+          0,            0,               msj2*gm,      msa2), nrow=4, ncol=4, byrow = T)
+        #
+        # Next lines do matrix multiplication (within-block demog transitions)
+        n2t[1:4,1] = n2[1:4,i,y-1]
+        if (rnd[y]){
+          nt2 = floor(AP2%*%n2t)   # randomly round up or down to integers
+        } else  {
+          nt2 = ceiling(AP2%*%n2t)
+        }
+        #
+        # ***NOTE: HERE IS WHERE HARVEST DEATHS ARE ACCOUNTED FOR
+        # (assume no more than 90% of otters in area could be harvested)
+        NH = max(0, min(0.95*sum(nt), abs(Harvest[i,y])))
+        if (NH < 5){
+          NH = min(floor(0.95*sum(nt)), rpois(1, NH))
+        } else {
+          NH = round(NH, 0)
+        }
+        # If there is a harvest, figure out age/sex class:
+        if (sum(nt1) > 0 & NH > 0){ 
+          # Option 1: harvest distributed randomly w.r.t. stage class
+          if (HarvestOpt == 1){
+            nh = rmultinom(1, NH, nt1/sum(nt1))
+          }
+          # Option 2  harvest is generally male/juvenile biased
+          if (HarvestOpt == 2) {
+            nh = rmultinom(1, NH, c(0.2, .1, .3, .4))
+          }
+          # Option 3  harvest structure extrapolated from reported data
+          if (HarvestOpt == 3 | HarvestOpt == 0) {
+            Harvrow = which(Harvest_demos[,2]==Bloknm & Harvest_demos[,1] == Yearnum)  
+            if (length(Harvrow) == 1) {
+              probs = Harvest_demos[Harvrow, 3:6]
+              if (sum(probs)==1) {
+                nh = rmultinom(1, NH, probs)
+              } else {
+                nh = rmultinom(1, NH, nt1/sum(nt1))
+              }
+            } else{
+              nh = rmultinom(1, NH, nt1/sum(nt1))
+            }
+          }
+          # NOW ADJUST FOR COMPENSATORY MORTALITY 
+          # (add otters that were harvested that would have died anyway back in)
+          # NOTE: adjusted such that average animal harvested 1/2 way thru year
+          nh[1] = floor(nh[1]*(fsj)^.5)
+          nh[2] = floor(nh[2]*(fsa)^.5)
+          nh[3] = floor(nh[3]*(msj)^.5)
+          nh[4] = floor(nh[4]*(msa)^.5)            
+        } else{
+          nh = c(0, 0, 0, 0)
+        }
+        nt1 = pmax(c(0,0,0,0),nt1 - nh)
+        # Next, Calculate number of dispersers (with stochasticity)
+        # ****NOTE: emmigration begins when local density >50% K
+        if(y==25 & Bloknm=="N02"){  # NOTE: over-ride for Glacier Bay colonization event
+          nd[1] = min(nt1[1]-2,123)
+          nd[2] = min(nt1[2]-2,132) 
+          nd[3] = min(nt1[3]-2,122) 
+          nd[2] = min(nt1[4]-2,123)
+          nd2 = nd
+        }else if(y==5 & Bloknm=="S02"){  # NOTE: over-ride for Coronation Isl colonization 
+          nd[1] = min(nt1[1]-2,10)
+          nd[2] = min(nt1[2]-2,10) 
+          nd[3] = min(nt1[3]-2,10) 
+          nd[2] = min(nt1[4]-2,10)
+          nd2 = nd
+        }else{
+          if ((N[i, y-1] / K[i])>0.5){
+            nd[1] = min(floor(nt1[1]/2), rpois(1,nt1[1]*disp[1,i]))
+            nd[2] = min(floor(nt1[2]/2), rpois(1,nt1[2]*disp[2,i]))
+            nd[3] = min(floor(nt1[3]/2), rpois(1,nt1[3]*disp[3,i]))
+            nd[4] = min(floor(nt1[4]/2), rpois(1,nt1[4]*disp[4,i]))
+          }else{
+            nd = c(0, 0, 0, 0)
+          }
+          if ((N2[i, y-1] / K[i])>0.5){
+            nd2[1] = min(floor(nt2[1]/2), rpois(1,nt2[1]*disp[1,i]))
+            nd2[2] = min(floor(nt2[2]/2), rpois(1,nt2[2]*disp[2,i]))
+            nd2[3] = min(floor(nt2[3]/2), rpois(1,nt2[3]*disp[3,i]))
+            nd2[4] = min(floor(nt2[4]/2), rpois(1,nt2[4]*disp[4,i]))
+          }else {
+            nd2 = c(0, 0, 0, 0)
+          }
+        }
+        n[1:4,i,y] = n[1:4,i,y] + (nt1 - nd)
+        n2[1:4,i,y] = n2[1:4,i,y] + (nt2 - nd2)
+        #
+        # Now distribute dispersers randomly among "currently occupied" blocks 
+        # with probabilities determined appropriately for each age/sex class
+        if (y==25 & Bloknm=="N02"){
+          n[1,3,y] = n[1,3,y]+nd[1]
+          n[2,3,y] = n[1,3,y]+nd[2]
+          n[3,3,y] = n[1,3,y]+nd[3]
+          n[4,3,y] = n[1,3,y]+nd[4]
+          n2[1,3,y] = n2[1,3,y]+nd2[1]
+          n2[2,3,y] = n2[1,3,y]+nd2[2]
+          n2[3,3,y] = n2[1,3,y]+nd2[3]
+          n2[4,3,y] = n2[1,3,y]+nd2[4]          
+        }else if (y==5 & Bloknm=="S02"){
+          n[1,31,y] = n[1,31,y]+nd[1]
+          n[2,31,y] = n[1,31,y]+nd[2]
+          n[3,31,y] = n[1,31,y]+nd[3]
+          n[4,31,y] = n[1,31,y]+nd[4]   
+          n2[1,31,y] = n2[1,31,y]+nd2[1]
+          n2[2,31,y] = n2[1,31,y]+nd2[2]
+          n2[3,31,y] = n2[1,31,y]+nd2[3]
+          n2[4,31,y] = n2[1,31,y]+nd2[4]             
+        }else {  
+          # JF dispersal
+          JFprob = BlokOcc[,y]*(destJF[,i] + 0.0000000000001)
+          JFprob = JFprob/(sum(JFprob))
+          ndJF = rmultinom(1, nd[1], JFprob)
+          if (sum(ndJF)>0){
+            ndJF2 = round(ndJF*(nd2[1]/max(1,nd[1])))
+          }else{
+            ndJF2 = rmultinom(1, nd2[2], JFprob)
+          }
+          n[1,,y] = n[1,,y] + t(ndJF)
+          n2[1,,y] = n2[1,,y] + t(ndJF2)
+          # AF dispersal
+          AFprob = BlokOcc[,y]*(destAF[,i] + 0.0000000000001)
+          AFprob = AFprob/(sum(AFprob))
+          ndAF = rmultinom(1, nd[2], AFprob)
+          if (sum(ndAF)>0){
+            ndAF2 = round(ndAF*(nd2[2]/max(1,nd[2])))
+          }else{
+            ndAF2 = rmultinom(1, nd2[2], AFprob)
+          }          
+          n[2,,y] = n[2,,y] + t(ndAF) 
+          n2[2,,y] = n2[2,,y] + t(ndAF2)
+          # JM dispersal
+          JMprob = BlokOcc[,y]*(destJM[,i] + 0.0000000000001) 
+          JMprob = JMprob/(sum(JMprob))
+          ndJM = rmultinom(1, nd[3], JMprob)
+          if (sum(ndJM)>0){
+            ndJM2 = round(ndJM*(nd2[3]/max(1,nd[3])))
+          }else{
+            ndJM2 = rmultinom(1, nd2[3], JMprob)
+          }           
+          n[3,,y] = n[3,,y] + t(ndJM)
+          n2[3,,y] = n2[3,,y] + t(ndJM2)
+          # AM dispersal
+          AMprob = BlokOcc[,y]*(destAM[,i] + 0.0000000000001) 
+          AMprob = AMprob/(sum(AMprob))
+          ndAM = rmultinom(1, nd[4], AMprob)
+          if (sum(ndAM)>0){
+            ndAM2 = round(ndAM*(nd2[4]/max(1,nd[4])))
+          }else{
+            ndAM2 = rmultinom(1, nd2[4], AMprob)
+          }             
+          n[4,,y] = n[4,,y] + t(ndAM)   
+          n2[4,,y] = n2[4,,y] + t(ndAM2)
+        }
+      }
+    }
+    # Tabulate sub-population abundance in each block 
+    N[,y] = colSums(n[,,y])
+    N2[,y] = colSums(n2[,,y])
+    # Nmn[,y] = Nmn[,y] + N[,y,r]/reps
+  }
+  result = list(N=N, N2=N2)
+  # result <- multiResultClass()
+  # result$result1  <- N
+  # result$result2 <- n
+  return(result)
+}
+N = array(data = 0, c(P,Nyrs,reps)) 
+N2 = N
+for (i in 1:reps){
+  N[,,i] = simresults[[i]]$N
+  N2[,,i] = simresults[[i]]$N2
+}
+# Compare simulation results to survey data
+N_est = numeric()
+N_est_sd = numeric()
+iii = which(startsWith(as.character(Blocks$Block_ID),"GBY"))
+tmp = N[iii,which(Years==Survest$Year[1]),]; tmp = colSums(tmp)
+N_est[1] = mean(tmp); N_est_sd[1] = sd(tmp)
+for(i in 2:dim(Survest)[1]){
+  iii = which(as.character(Blocks$Block_ID)==as.character(Survest$Subregion[i]))
+  tmp = N[iii,which(Years==Survest$Year[i]),]
+  N_est[i] = mean(tmp); N_est_sd[i] = sd(tmp)
+}
+Survest$EstN = N_est
+Survest$EstN_sd = N_est_sd
+summary(lm(EstN~Mean, data=Survest, weights=1/EstN_sd^2))
+
+pltcomp = ggplot(Survest,aes(x=Mean,y=EstN)) +
+  geom_abline(intercept = 0, slope = 1,linetype="dashed") +
+  #geom_smooth(method='lm',formula=y~x) +
+  #geom_smooth(method = "lm", mapping = aes(weight = 1/EstN_sd^2), color = "black", show.legend = FALSE) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin=EstN-EstN_sd, ymax=EstN+EstN_sd), width = 0, lwd = 0.5) +
+  scale_y_continuous(limits = c(0, 8000),breaks = c(0, 2000, 4000, 6000, 8000)) +
+  scale_x_continuous(limits = c(0, 8000),breaks = c(0, 2000, 4000, 6000, 8000)) +
+  labs(x="Survey estimates",y="Simulation model projections")
+print(pltcomp)
+```
+
+### Calcualte bootstrap confidnece intervals
+```{r bootstrap}
+## Calculate mean trend and CI (use bootstrap CI, 10000 reps) ##
+randsmp = sample(seq(1:reps), 10000, replace = TRUE)
+titltxt = 'Projected Population Growth (Grey=Harvest, Blue=No Harvest)'
+# First, entire Metapopulation (all of SEAK):
+tmp = matrix(nrow = 10000, ncol = Nyrs)
+tmp2 = matrix(nrow = 10000, ncol = Nyrs)
+for(r in 1:10000){
+  tmp[r,] <- colSums(N[, , randsmp[r]])
+  tmp2[r,] <- colSums(N2[, , randsmp[r]])
+}
+RepSums_SEAK <- data.frame(tmp)
+RepSums_SEAK_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+SE_Overall <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+SE_Overall_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# SEAK #
+plt <- (ggplot(SE_Overall, aes(Year, Mean))+
+          geom_line(data=SE_Overall)+
+          geom_ribbon(data=SE_Overall,aes(ymin=lower,ymax=upper),alpha=0.2) +
+          geom_line(data=SE_Overall_NH,aes(Year, Mean),colour="blue")+
+          geom_ribbon(data=SE_Overall_NH,aes(ymin=lower,ymax=upper),
+                      fill = "blue",alpha=0.2) +          
+          xlab("Year") +
+          ylab("Expected Population Size") +
+          ggtitle(titltxt,subtitle="All of SEAK"))
+print(plt)
+
+# Next, Sitka Sound:
+iii = which(Blocks$Block_ID =="N05")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_Sitka <- data.frame(tmp)
+RepSums_Sitka_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Sitka_Sound <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Sitka_Sound_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Keku Strait :
+iii = which(Blocks$Block_ID == "S08")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_Keku <- data.frame(tmp)
+RepSums_Keku_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Keku_Strait <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Keku_Strait_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Barrier Islands :
+iii = which(Blocks$Block_ID == "S05")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_Barrier <- data.frame(tmp)
+RepSums_Barrier_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Barrier_Islands <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Barrier_Islands_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Maurelle Islands :
+iii = which(Blocks$Block_ID == "S02")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_Maurelle <- data.frame(tmp)
+RepSums_Maurelle_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Maurelle_Islands <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Maurelle_Islands_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Bucareli Bay :
+iii = which(Blocks$Block_ID == "S03")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_Bucareli <- data.frame(tmp)
+RepSums_Bucareli_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Bucareli_Bay <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Bucareli_Bay_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Glacier Bay :
+iii = which(startsWith(as.character(Blocks$Block_ID),"GBY"))
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_GBY <- data.frame(tmp)
+RepSums_GBY_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Glacier_Bay <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Glacier_Bay_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+
+# Next, Icy Straits  :
+iii = which(Blocks$Block_ID == "N02")
+tmp = matrix(nrow=10000,ncol = Nyrs); tmp2=tmp
+for(r in 1:10000){
+  if (length(iii)==1){
+    tmp[r,] <- N[iii, , randsmp[r]]
+    tmp2[r,] <- N2[iii, , randsmp[r]]
+  }else{
+    tmp[r,] <- colSums(N[iii, , randsmp[r]])
+    tmp2[r,] <- colSums(N2[iii, , randsmp[r]])
+  }
+}
+RepSums_IcyStrait <- data.frame(tmp)
+RepSums_IcyStrait_NH <- data.frame(tmp2)
+#
+Lo = numeric(length = Nyrs)
+Hi = numeric(length = Nyrs)
+means = numeric(length = Nyrs)
+means[1] <- mean(tmp[,1])
+Lo2 = numeric(length = Nyrs)
+Hi2 = numeric(length = Nyrs)
+means2 = numeric(length = Nyrs)
+means2[1] <- mean(tmp2[,1])
+for(y in 2:Nyrs){
+  dens = density(tmp[,y],adjust = 7)
+  CI = quantile(dens, probs=c(.025, .975))
+  Lo[y] <- max(0, as.numeric(CI[1]))
+  Hi[y] <- as.numeric(CI[2])
+  means[y] <- mean(tmp[, y])
+  dens2 = density(tmp2[,y],adjust = 7)
+  CI2 = quantile(dens2, probs=c(.025, .975))
+  Lo2[y] <- max(0, as.numeric(CI2[1]))
+  Hi2[y] <- as.numeric(CI2[2])
+  means2[y] <- mean(tmp2[, y]) 
+}
+Icy_Straits <- data.frame(Year=Years, Mean=means, lower=Lo, upper=Hi)
+Icy_Straits_NH <- data.frame(Year=Years, Mean= means2, lower=Lo2, upper=Hi2)
+```
+
+### Summary Plots
+```{r summary plots}
+## Plot Naming ##
+if(HarvestOpt > 0){
+  titltxt = 'Projected Population Growth With Harvest'
+}else{
+  titltxt = 'Projected Population Growth NO Harvest'
+}
+
+## Summary Plots ##
+# Sitka #
+plt2 <- (ggplot(Sitka_Sound, aes(Year, Mean))+
+           geom_line(data=Sitka_Sound)+
+           geom_ribbon(data=Sitka_Sound,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Sitka_Sound_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Sitka_Sound_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") +
+           ggtitle(titltxt,subtitle="Sitka Sound"))
+print(plt2)
+
+# Keku #
+plt3 <- (ggplot(Keku_Strait, aes(Year, Mean))+
+           geom_line(data=Keku_Strait)+
+           geom_ribbon(data=Keku_Strait,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Keku_Strait_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Keku_Strait_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") +
+           ggtitle(titltxt,subtitle="Keku Strait"))
+print(plt3)
+
+# Barriers #
+plt4 <- (ggplot(Barrier_Islands, aes(Year, Mean))+
+           geom_line(data=Barrier_Islands)+
+           geom_ribbon(data=Barrier_Islands,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Barrier_Islands_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Barrier_Islands_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") + 
+           ggtitle(titltxt,subtitle="Barrier Islands"))
+print(plt4)
+
+# Maurelle #
+plt5 <- (ggplot(Maurelle_Islands, aes(Year, Mean))+
+           geom_line(data=Maurelle_Islands)+
+           geom_ribbon(data=Maurelle_Islands,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Maurelle_Islands_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Maurelle_Islands_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") + 
+           ggtitle(titltxt,subtitle="Maurelle Islands"))
+print(plt5)
+
+# Bucareli Bay #
+plt6 <- (ggplot(Bucareli_Bay, aes(Year, Mean))+
+           geom_line(data=Bucareli_Bay)+
+           geom_ribbon(data=Bucareli_Bay,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Bucareli_Bay_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Bucareli_Bay_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") + 
+           ggtitle(titltxt,subtitle="Bucareli_Bay"))
+print(plt6)
+
+# Glacier Bay #
+plt7 <- (ggplot(Glacier_Bay, aes(Year, Mean))+
+           geom_line(data=Glacier_Bay)+
+           geom_ribbon(data=Glacier_Bay,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Glacier_Bay_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Glacier_Bay_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") + 
+           ggtitle(titltxt,subtitle="Glacier_Bay"))
+print(plt7)
+
+# Icy_Str #
+plt8 <- (ggplot(Icy_Straits, aes(Year, Mean))+
+           geom_line(data=Icy_Straits)+
+           geom_ribbon(data=Icy_Straits,aes(ymin=lower,ymax=upper),alpha=0.2) +
+           geom_line(data=Icy_Straits_NH,aes(Year, Mean),colour="blue")+
+           geom_ribbon(data=Icy_Straits_NH,aes(ymin=lower,ymax=upper),
+                       fill = "blue",alpha=0.2) +          
+           xlab("Year") +
+           ylab("Expected Population Size") + 
+           ggtitle(titltxt,subtitle="Icy_Straits"))
+print(plt8)
+```
+
+## Data Compile
+```{r final data compile}
+# Finally, for each block (the BIG block table)
+meansALL = numeric(length = P * Nyrs)
+LoALL = numeric(length = P * Nyrs)
+HiALL = numeric(length = P * Nyrs)
+YearsALL = numeric(length = P * Nyrs)
+BlockIDs = character(length = P * Nyrs)
+for (p in 1:P){
+  tmp = matrix(nrow=10000, ncol = Nyrs)
+  for(r in 1:10000){
+    tmp[r,] <- (N[p, , randsmp[r]])
+  }
+  Lo = numeric(length = Nyrs)
+  Hi = numeric(length = Nyrs)
+  means = numeric(length = Nyrs)
+  means[1] <- mean(tmp[, 1])
+  for(y in 2:Nyrs){
+    dens = density(tmp[,y],adjust = 7)
+    CI = quantile(dens, probs = c(.025, .975))
+    Lo[y] <- max(0, as.numeric(CI[1]))
+    Hi[y] <- as.numeric(CI[2])
+    means[y] <- mean(tmp[, y])
+  }
+  meansALL[((p-1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = means
+  LoALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Lo
+  HiALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Hi
+  YearsALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Years
+  BlockIDs[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = as.character(rep(Blocks$Block_ID[p],Nyrs))
+}
+Hab_Blocks <- data.frame(Block = BlockIDs, Year = YearsALL, Mean = meansALL, lower = LoALL, upper = HiALL)
+
+meansALL = numeric(length = P * Nyrs)
+LoALL = numeric(length = P * Nyrs)
+HiALL = numeric(length = P * Nyrs)
+YearsALL = numeric(length = P * Nyrs)
+BlockIDs = character(length = P * Nyrs)
+for (p in 1:P){
+  tmp = matrix(nrow=10000, ncol = Nyrs)
+  for(r in 1:10000){
+    tmp[r,] <- (N2[p, , randsmp[r]])
+  }
+  Lo = numeric(length = Nyrs)
+  Hi = numeric(length = Nyrs)
+  means = numeric(length = Nyrs)
+  means[1] <- mean(tmp[, 1])
+  for(y in 2:Nyrs){
+    dens = density(tmp[,y],adjust = 7)
+    CI = quantile(dens, probs = c(.025, .975))
+    Lo[y] <- max(0, as.numeric(CI[1]))
+    Hi[y] <- as.numeric(CI[2])
+    means[y] <- mean(tmp[, y])
+  }
+  meansALL[((p-1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = means
+  LoALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Lo
+  HiALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Hi
+  YearsALL[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = Years
+  BlockIDs[((p - 1) * Nyrs + 1):((p - 1) * Nyrs + Nyrs)] = as.character(rep(Blocks$Block_ID[p],Nyrs))
+}
+Hab_Blocks_NH <- data.frame(Block = BlockIDs, Year = YearsALL, Mean = meansALL, lower = LoALL, upper = HiALL)
+
+stopCluster(cl)
+```
+
+## Export
+```{r export}
+#### Export results ####
+## Harvest Results ##
+simtype ='harv'
+filename1 = paste0("output_",simtype,"_", format(Sys.time(), "%a%b%d"),"_",format(Sys.time(), "%Y"))
+filename2 = paste0("repsums_",simtype,"_", format(Sys.time(), "%a%b%d"),"_",format(Sys.time(), "%Y"))
+
+# Output #
+write.csv(SE_Overall, paste0("Model_Output/", filename1,"_SEAK.csv"))
+write.csv(Sitka_Sound, paste0("Model_Output/", filename1,"_Sitka.csv"))
+write.csv(Keku_Strait, paste0("Model_Output/", filename1,"_Keku.csv"))
+write.csv(Barrier_Islands, paste0("Model_Output/", filename1,"_Barrier.csv"))
+write.csv(Maurelle_Islands, paste0("Model_Output/", filename1,"_Maurelle.csv"))
+write.csv(Bucareli_Bay, paste0("Model_Output/", filename1,"_Bucareli.csv"))
+write.csv(Hab_Blocks, paste0("Model_Output/", filename1,"_HabBlks.csv"))
+
+# RepSums #
+write.csv(RepSums_SEAK, paste0("Model_Output/", filename2,"_SEAK.csv"))
+write.csv(RepSums_Sitka, paste0("Model_Output/", filename2,"_Sitka.csv"))
+write.csv(RepSums_Keku, paste0("Model_Output/", filename2,"_Keku.csv"))
+write.csv(RepSums_Barrier, paste0("Model_Output/", filename2,"_Barrier.csv"))
+write.csv(RepSums_Maurelle, paste0("Model_Output/", filename2,"_Maurelle.csv"))
+write.csv(RepSums_Bucareli, paste0("Model_Output/", filename2,"_Bucareli.csv"))
+
+## NO harvest Results ##
+simtype ='noharv'
+filename1 = paste0("output_",simtype,"_", format(Sys.time(), "%a%b%d"),"_",format(Sys.time(), "%Y"))
+filename2 = paste0("repsums_",simtype,"_", format(Sys.time(), "%a%b%d"),"_",format(Sys.time(), "%Y"))
+
+# Output #
+write.csv(SE_Overall_NH, paste0("Model_Output/", filename1,"_SEAK.csv"))
+write.csv(Sitka_Sound_NH, paste0("Model_Output/", filename1,"_Sitka.csv"))
+write.csv(Keku_Strait_NH, paste0("Model_Output/", filename1,"_Keku.csv"))
+write.csv(Barrier_Islands_NH, paste0("Model_Output/", filename1,"_Barrier.csv"))
+write.csv(Maurelle_Islands_NH, paste0("Model_Output/", filename1,"_Maurelle.csv"))
+write.csv(Bucareli_Bay_NH, paste0("Model_Output/", filename1,"_Bucareli.csv"))
+write.csv(Hab_Blocks_NH, paste0("Model_Output/", filename1,"_HabBlks.csv"))
+
+# RepSums #
+write.csv(RepSums_SEAK_NH, paste0("Model_Output/", filename2,"_SEAK.csv"))
+write.csv(RepSums_Sitka_NH, paste0("Model_Output/", filename2,"_Sitka.csv"))
+write.csv(RepSums_Keku_NH, paste0("Model_Output/", filename2,"_Keku.csv"))
+write.csv(RepSums_Barrier_NH, paste0("Model_Output/", filename2,"_Barrier.csv"))
+write.csv(RepSums_Maurelle_NH, paste0("Model_Output/", filename2,"_Maurelle.csv"))
+write.csv(RepSums_Bucareli_NH, paste0("Model_Output/", filename2,"_Bucareli.csv"))
+
+```

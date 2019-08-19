@@ -1,0 +1,50 @@
+---
+title: "Hunters_to_harvests"
+author: "Wendel Raymond"
+date: "August 19, 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+# Hunters to harvests
+The goal is to assign unique hunter IDs to specific hunts to that the number of hunters hunting in a subregion can be calculated. This would be an improvment over assuming that the village were the the harvest was reported was directly adjecent to where the sea otter came from.
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+library(BMS)
+library(sp)
+library(rgdal)
+
+theme_set(theme_classic())
+```
+
+## Data
+Harvest and hunter data can be obtained from USFWS Marking Tagging and Reporting Program.
+```{r data}
+# Harvest #
+harv <- read.csv()
+
+# Hunter harvest data #
+hunt <- read.csv()
+hunt$Hunter_Name <- as.character(hunt$Hunter_Name)
+```
+
+## Prep for merging
+To merge, date and location need to be in the same fromat.
+```{r prep}
+str(hunt)
+str(harv)
+```
+
+## Merge
+```{r merge}
+dat <- merge(harv, hunt[, c(1:5)], by.x = c("Kill.Loc", "Year", "Tag.Loc.Name"), by.y = c("Kill_Location", "Year", "Village"), all.x = TRUE)
+```
+

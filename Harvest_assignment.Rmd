@@ -1,0 +1,83 @@
+---
+title: "Harvest_assignment"
+author: "Wendel Raymond"
+date: "August 19, 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+# Assignment of harvest data to sup-populations
+Harvest records will be assigned to sup-population blocks based on location
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(spatstat)
+library(maptools)
+library(rgdal)
+library(sp)
+library(rgeos)
+library(raster)
+library(spatialEco)
+```
+
+## Data
+Import shapefile of harvest sea otters and sub-popualtions
+Harvest data can be obtained from USFWS Marking Tagging and Reporting Program.
+```{r}
+## Harvested sea otters ##
+harv <- readOGR()
+
+## Sub-populations ****Use buffered file to avoid self intersecting polygons**** ##
+SubPops <- readOGR(dsn="All_data", layer = "SEAK_Subpopulations_WR_UTM")
+proj4string(SubPops) <- CRS("+proj=utm +zone=8 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+plot(SubPops)
+
+## Harvest Assignment Template #
+temp <- read.csv("All_Data/Harvest Assignment_template.csv", header = TRUE)
+```
+
+## Spatial join
+Direct spatial join to create harvest by subpopulation by year. Then extract data.
+```{r join}
+## Spatial Join ##
+harv.subpop <- point.in.poly(harv, SubPops)
+
+harv.subpop.dat <- harv.subpop@data
+```
+
+## Sub-population by year matirx
+```{r pop by year}
+## Build matix ##
+harvests <- data.frame(
+  harv.subpop.dat %>% 
+    group_by(Year, Subpop) %>% 
+    summarise(Count = n())
+)
+
+# Spread to make matrix #
+harvests <- spread(harvests, key = Year, value = Count)
+
+# Merge harvests with template #
+harvests.full <- merge(temp, harvests, by.x = "Block_ID", by.y = "Subpop", all.x = TRUE)
+
+# Re sort #
+harvests.full <- harvests.full[order(harvests.full$SortOrd),]
+
+# Rename columns #
+colnames(harvests.full) <- c("Subpop", "SortOrd", "W_ID", as.character(1970:2015))
+
+# Fill NAs with 0s #
+harvests.full[is.na(harvests.full)] <- 0
+```
+
+## Export
+```{r export}
+write.csv(harvests.full, "All_Data/N_Harvest.csv", row.names = FALSE)
+```
+

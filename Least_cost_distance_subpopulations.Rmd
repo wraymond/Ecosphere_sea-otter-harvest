@@ -1,0 +1,105 @@
+---
+title: "Least_cost_distance_subpopulations"
+author: "Wendel Raymond"
+date: "August 19, 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+# Least cost distance of Subpopulations
+The distance from one subpopulation centroid to all other subpopulations centroids will be calculated. This will be done using a cost distance caluclation in order to restrict path movements to water bodies that sea otter are likley to travel in. 
+
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(spatstat)
+library(maptools)
+library(rgdal)
+library(rgeos)
+library(raster)
+library(gdistance)
+library(matrixStats)
+```
+
+## Data
+For analysis we will need the shapefile of subpopulation centoids and a cost raster. 
+```{r data}
+## Centroids ##
+# Run this code in this order! This will extract the names bofore you delete them #
+centroids <- readOGR(dsn="All_data", layer="SEAK_Subpopulations_Centroids_WR_UTM")
+
+## Cost Raster with 250 meter grid cells ##
+cost.rast <- raster("All_data/seakrast_250m.tif")
+```
+
+Now for some data clean up and preparation. We need to remove the Yakutat subpopulation because we assume that there is not movement in or out of the subpopulation.
+```{r data prep}
+# Append coordinants #
+centroids <- cbind(centroids@data, centroids@coords)
+
+# Remove Yakutat #
+centroids <- centroids[!(centroids$Subpop == "YAK"),]
+
+# Save names #
+names <- as.character(centroids$Subpop)
+
+# Covert to just coordinants #
+centroids <- data.frame(cbind(centroids$coords.x1, centroids$coords.x2))
+
+# Convert to SpatialPoints #
+centroids <- SpatialPoints(centroids)
+```
+
+Check data
+```{r plot data check}
+plot(centroids)
+
+plot(cost.rast)
+```
+
+## Calculate Distance
+Calculate the distance from all centroids to all other centroids by restricting path to the cost raster.
+```{r dist calc}
+## Create Tansition layer ##
+trans.lyr <- transition(1/cost.rast, transitionFunction = mean, directions = 8)
+trans.lyr <- geoCorrection(trans.lyr, type = "c")
+
+## Actual Calculation ##
+centroids.dist <- costDistance(x = trans.lyr, centroids, centroids)
+
+## Clean up data frame ##
+centroids.dist <- data.frame(centroids.dist)
+centroids.dist <- cbind(names, centroids.dist)
+colnames(centroids.dist) <- c("Subpop", names)
+```
+
+## Export
+```{r export}
+## Write Table ##
+write.csv(centroids.dist, file = "All_Data/Centroids_LCD.csv", row.names = names)
+
+## Write Transition Layer ##
+writeRaster(trans.lyr, file = "LCD Raster Trans.tif", format = "GTiff")
+```
+
+## Calculate mean distance
+```{r summary dist}
+Centroids_LCD <- read.csv("All_Data/Centroids_LCD.csv")
+
+Bmat <- as.matrix(Centroids_LCD[,3:ncol(Centroids_LCD)])
+
+nrdist <- numeric()
+
+for(i in 1:nrow(Bmat)){
+  nrdist[i] = min(Bmat[which(Bmat[,i] > 0),i])
+}
+
+hist(nrdist, 25)
+mean_neighbour_dist_km <- mean(nrdist/1000)
+sd_neighbour_dist_km <- sd(nrdist/1000)
+```
+

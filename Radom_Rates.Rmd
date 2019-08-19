@@ -1,0 +1,140 @@
+---
+title: "Random_Rates"
+author: "Wendel Raymond and Tim Tinker"
+date: "August 19, 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+# Random Rates
+Script to generate table of random demographic rates for use in sea otter projection matrix with 2 sexes and 2 stages (juvenile/adult). Vital rates are stage-specific birth rates, wean success rates, and survival rates for females and males. Random sets of rates are interpolated between a set of "High" rates estimated from a low-density, rapidly growing pop (Kodiak), and a set of "Low Rates" estimated from a low-density, approx stable pop (Amchitka). To account for demographic stochasticity, rather than using linear interpolation between these extremes, we generate vectors of correlated random proportions to use as interploating factors, such that on any given year some rates will be higher and some lower. We genenerate correlated random normal variables and then inverse-logit transform to create vectors of proportions with the desired correlation. Although each set of rates is thus be unique, they all tend to reflect the general life history schedule of higher adult than juvenile survival, and weaning success lower than juvenile survival. Each set of random rates has an associated lambda, but for any given lambda there are many ways to achieve it with different combinations of biologically feasible vital rates.
+
+```{r libraries}
+library(gtools)
+library(ggplot2)
+library(reshape2)
+
+theme_set(theme_classic())
+```
+
+## Create function for sea otter matriX 
+```{r matrix function}
+matfun = function(x){
+  br = x[1]/2; wr=x[2]; fsj = x[3]; fsa = x[4]; msj = x[5]; msa = x[6]
+  TD = 3;  #stage duration for sub-adult
+  lm = 1; # Initial lambda estimate (use iterations to stabalize)
+  for (i in 1:5){
+    gf = ((fsj/lm)^TD - (fsj/lm)^(TD-1))/((fsj/lm)^TD -1);
+    gm = ((msj/lm)^TD - (msj/lm)^(TD-1))/((msj/lm)^TD -1);
+    M = matrix(c(
+          fsj*(1-gf),  br*wr*fsa,      0,           0,    
+          fsj*gf,      fsa,            0,           0,
+          0,           br*wr*fsa,      msj*(1-gm),  0,
+          0,           0,              msj*gm,      msa), nrow=4, ncol=4, byrow = T)
+    lm = max(eigen(M)$values)
+  }
+  result = list(vrates = c(2*br,wr,fsj,fsa,msj,msa,gf,gm),lam=round(lm,2))
+  return(result)
+}
+```
+
+## Rate generation
+See references in manuscript text
+```{r random rates}
+## Random rate interpolation ##
+reps <- 1000
+vrates <- matrix(0, reps, 8)
+Gvals <- matrix(0, reps, 2)
+lams <- matrix(0, reps, 1)
+L <- matrix(c(0.98, 0.50, 0.75, 0.85, 0.73, 0.83)) # Amchitka, near K
+H <- matrix(c(0.98, 0.95, 0.97, 0.99, 0.96, 0.98)) # Kodiak, near r max
+AL = matfun(L)
+AH = matfun(H)
+# create correlated random proportions (use logit transformation of correlated random normals)
+crl = 0.95   # Approximate desired correlation between vital rates 
+x1 <- rnorm(reps, 0, 1.5)    # random normals
+x2345 <- scale(matrix( rnorm(4*reps), ncol=4 ))
+x12345 <- cbind(scale(x1),x2345)
+c1 <- var(x12345)
+chol1 <- solve(chol(c1))
+newx <-  x12345 %*% chol1 
+# create correlation structure
+newc <- matrix( 
+c(1  , crl, crl, crl, crl, 
+  crl, 1  , crl, crl, crl,
+  crl, crl, 1  , crl, crl,
+  crl, crl, crl, 1  , crl,
+  crl, crl, crl, crl,  1), ncol=5 )
+chol2 <- chol(newc)
+corrx <- newx %*% chol2 * sd(x1) + mean(x1)
+interp <- inv.logit(corrx)  # convert to proportions using inverse logit
+# zapsmall(cor(interp))
+# pairs(interp[1:200,])
+# hist(interp[,1])
+vrateRand = matrix(0,nrow = reps,ncol=9) 
+vrateRand[1,1] = AL$lam 
+vrateRand[1,2:9] = AL$vrates 
+vrateRand[2,1] = AH$lam 
+vrateRand[2,2:9] = AH$vrates 
+for (i in 3:reps){
+  vr = c(0.98,interp[i,]*(L[2:6]) + (1-interp[i,])*(H[2:6]))
+  rslt = matfun(vr)
+  vrateRand[i,1] = rslt$lam 
+  vrateRand[i,2:9] = rslt$vrates 
+}
+Demdat = data.frame(Lam = vrateRand[,1],
+                    br1 = rep(0,reps),
+                    br2 = vrateRand[,2],
+                    wr1 = rep(0,reps),
+                    wr2 = vrateRand[,3],
+                    fs1 = vrateRand[,4],
+                    fs2 = vrateRand[,5],
+                    ms1 = vrateRand[,6],
+                    ms2 = vrateRand[,7],
+                    Gf = vrateRand[,8],
+                    Gm = vrateRand[,9])
+hist(Demdat$Lam)
+# Create figure showing variaiton in vital rates (female survival)
+sfar = numeric()
+sfjr = numeric()
+densK = numeric()
+pK = seq(0.05,1,by=0.05)
+c = 0
+rmax=0.25
+sig = 0.13
+for (i in 1:20){
+  pKi = pK[i]
+  for (j in 1:100){
+    c = c+1
+    lamstoch = max(.95, min(1.22, round(exp(rmax * (1 - (pKi)) +
+                                              rnorm(1, 0, sig)), 2)))
+    
+    idxs = which(round(Demdat$Lam,2) == lamstoch)
+    if(length(idxs)==1){
+      j=idxs
+    }else{
+      j = sample(idxs,1)
+    }
+    sfjr[c] = Demdat$fs1[j] 
+    sfar[c] = Demdat$fs2[j] 
+    densK[c] = pKi
+  }
+}
+dfVRplt = data.frame(Relative_Density = as.factor(round(densK,1)),
+                     Adult_Female_Survival = sfar,
+                     Juvenile_Female_Survival = sfjr)
+dfVRplt = melt(dfVRplt,id= "Relative_Density")
+
+## Plot ##
+ggplot(dfVRplt,aes(x=Relative_Density,y=value,fill=variable)) +
+  geom_boxplot(position=position_dodge(1),outlier.shape = NA) +
+  scale_fill_manual(values=c("#E69F00", "#56B4E9"), name = "Variable", labels  = c ("Adult female survival", "Juvenile female survival")) +
+  labs(x="Density relative to K", y = "Annual survival rate")
+
+write.csv(Demdat,"All_data/RandDem.csv",row.names = F)
+```
+

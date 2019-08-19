@@ -1,0 +1,158 @@
+---
+title: "SEAK_Census_Data"
+author: "Wendel Raymond"
+date: "August 19, 2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Code for Ecosphere "Location specific factors influence patterns and effects of subsistence sea otter harvest in Southeast Alaska"
+Wendel W. Raymond, M. Tim Tinker, Michelle L. Kissling, Brad Benter, Verena A. Gill, Ginny L. Eckert
+wraymond2@alaska.edu
+
+# SEAK census data
+Extract community level population data to fit simple population trajectory.
+
+Libraries
+```{r}
+library(tidycensus)
+library(tidyverse)
+
+census_api_key("67befbc8146f289db38c0e1b0a29a1f476ac5af5")
+
+theme_set(theme_classic())
+```
+
+## Data
+Other data to reference
+Harvest and hunter data can be obtained from USFWS Marking Tagging and Reporting Program.
+```{r}
+harv <- read.csv()
+hunt <- read.csv()
+hunt$Hunter_Name <- as.character(hunt$Hunter_Name)
+```
+
+
+## Extract Census Data
+We want to extract population data from comminties that report sea otter hunting.
+```{r}
+## Select Varibles ##
+vars <- load_variables(2010, dataset = "sf1", cache = TRUE)
+
+## Census Data ##
+pop1990 <- get_decennial(geography = "place", variables = "P0010001", year = 1990)
+pop2000 <- get_decennial(geography = "place", variables = "P001001", year = 2000)
+pop2010 <- get_decennial(geography = "place", variables = "P001001", year = 2010)
+```
+
+### Filter to communities where hunting occurs
+Match hunter communities with cencus data. We can make use of GeoIDs in the census data to help!
+```{r}
+## Extract Communities ##
+com <- unique(hunt$Village)
+com <- com[c(1:4, 6:14, 16:18, 21)] # remove non SEAK
+
+## Filtering ##
+# matching communities to GeoID #
+com
+com.full <- data.frame(com = com, GEOID = c("0203440", "0270540", "0240400", "0236770", "0236400", "0260310", "0233360", "0259650", "0230940", "0286380", "0238970", "0217740", "0234460", "0237650", "0252845", "0216360", "0286490"))
+
+pop1990.seak <- pop1990[match(com.full$GEOID, pop1990$GEOID), ]
+pop1990.seak$Year <- 1990
+pop1990.seak$com <- com
+pop2000.seak <- pop2000[match(com.full$GEOID, pop2000$GEOID), ]
+pop2000.seak$Year <- 2000
+pop2000.seak$com <- com
+pop2010.seak <- pop2010[match(com.full$GEOID, pop2010$GEOID), ]
+pop2010.seak$Year <- 2010
+pop2010.seak$com <- com
+```
+
+### Combine to master dataframe
+Join all years together and match community names
+```{r}
+d <- rbind(pop1990.seak, pop2000.seak, pop2010.seak)
+d <- d[, c(1, 3:6)]
+d <- d[order(d$com), ]
+```
+
+## Population tragectories
+So we can estimate population size in every year we can fit simple regressions to the data and use the resulting equation to estimate population from 1990-2010.
+```{r}
+## Plots of population through time ##
+ggplot(d) +
+  geom_point(aes(x = Year, y = value)) +
+  geom_smooth(aes(x = Year, y = value), method = loess) +
+  facet_wrap(~com, scales = "free")
+
+## Estimating growth rate between censuses ##
+# Find defferences #
+j <- data.frame()
+for(c in unique(d$GEOID)){
+  i <- filter(d, GEOID == c)
+  q <- i[2, 3] - i[1, 3]
+  r <- i[3, 3] - i[2, 3]
+  k <- data.frame(GEOID = c, q = q, r = r)
+  j <- rbind(j, k)
+}
+
+# calcualte rate to per year #
+j$rate.q <- j$value/10
+j$rate.r <- j$value.1/10
+
+## Fill in years ##
+d <- merge(d, j, by = "GEOID", all.x = TRUE)
+
+# 1991 - 1999 #
+d.1990 <- d[d$Year == 1990,]
+d.1990$x1990 <- d.1990$value.x
+d.1990$x1991 <- (d.1990$value.x + d.1990$rate.q)
+d.1990$x1992 <- (d.1990$x1991 + d.1990$rate.q)
+d.1990$x1993 <- (d.1990$x1992 + d.1990$rate.q)
+d.1990$x1994 <- (d.1990$x1993 + d.1990$rate.q)
+d.1990$x1995 <- (d.1990$x1994 + d.1990$rate.q)
+d.1990$x1996 <- (d.1990$x1995 + d.1990$rate.q)
+d.1990$x1997 <- (d.1990$x1996 + d.1990$rate.q)
+d.1990$x1998 <- (d.1990$x1997 + d.1990$rate.q)
+d.1990$x1999 <- (d.1990$x1998 + d.1990$rate.q)
+
+# 2000 - 2010 #
+d.2000 <- d[d$Year == 2000,]
+d.2000$x2000 <- d.2000$value.x
+d.2000$x2001 <- (d.2000$value.x + d.2000$rate.r)
+d.2000$x2002 <- (d.2000$x2001 + d.2000$rate.r)
+d.2000$x2003 <- (d.2000$x2002 + d.2000$rate.r)
+d.2000$x2004 <- (d.2000$x2003 + d.2000$rate.r)
+d.2000$x2005 <- (d.2000$x2004 + d.2000$rate.r)
+d.2000$x2006 <- (d.2000$x2005 + d.2000$rate.r)
+d.2000$x2007 <- (d.2000$x2006 + d.2000$rate.r)
+d.2000$x2008 <- (d.2000$x2007 + d.2000$rate.r)
+d.2000$x2009 <- (d.2000$x2008 + d.2000$rate.r)
+d.2000$x2010 <- d$value.x[d$Year == 2010]
+
+# combine #
+n <- d.1990[, c(1,5, 10:19)]
+l <- d.2000[, 10:20]
+pop.est <- cbind(n, l)
+
+# convert to tall #
+t <- gather(pop.est[,3:23], key = "xYear", value = "n")
+t$GEOID <- rep(unique(pop.est$GEOID), 21)
+
+# FINAL #
+pop.est <- merge(pop.est[, c(1,2)], t, by = "GEOID")
+pop.est$Year <- gsub("x", "", pop.est$xYear)
+pop.est$Year <- as.numeric(as.numeric(pop.est$Year))
+
+## Plot ##
+ggplot(pop.est) +
+  geom_point(aes(x = Year, y = n)) +
+  facet_wrap(~com, scales = "free")
+```
+
+## Export
+```{r}
+write.csv(pop.est, "All_Data/census_hunting_comm_est.csv", row.names = FALSE)
+```
+
+
